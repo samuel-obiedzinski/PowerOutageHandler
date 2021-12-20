@@ -1,23 +1,104 @@
 # -*- coding: utf-8 -*-
 from Plugins.Plugin import PluginDescriptor
 from Components.ConfigList import ConfigListScreen
-from Components.config import config, getConfigListEntry, ConfigSubsection, ConfigEnableDisable, ConfigInteger
+from Components.config import config, getConfigListEntry, ConfigSubsection, ConfigEnableDisable, ConfigInteger, ConfigSelection
 from Components.Sources.StaticText import StaticText
 from Components.ActionMap import ActionMap
 from enigma import eTimer, eActionMap, eConsoleAppContainer, getDesktop
-from Screens.Standby import Standby, inStandby
 from Screens.Screen import Screen
-from Tools import Notifications
 
 import os
 import stat
 
 config.plugins.PowerOutageHandler = ConfigSubsection()
-config.plugins.PowerOutageHandler.Enable = ConfigEnableDisable(default=True)
-config.plugins.PowerOutageHandler.Delay = ConfigInteger(30, (5, 300))
+config.plugins.PowerOutageHandler.Delay = ConfigInteger(60, (5, 300))
+config.plugins.PowerOutageHandler.Mode = ConfigSelection(default = "standby", choices = [("standby", "standby"),("standby_notify", "standby notify"),("deepstandby", "deep standby")]) 
+
+STATE_FILE = "/etc/enigma2/poh_state.txt"
+STATE_STANDBY = 0
+STATE_NORMAL = 1
+
+def IsInStandby():
+    from Screens.Standby import inStandby
+    return inStandby != None
 
 def Print(txt):
+    with open("/tmp/PowerOutageHandler.txt", "a+") as f:
+        f.write("%s" % txt)
+        f.write('\n')
     print('PowerOutageHandler: %s' % txt)
+
+def GetState():
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = f.read().strip()
+        if data == "standby":
+            return STATE_STANDBY
+        elif data == "normal":
+            return STATE_NORMAL
+        Print('GetState: unknown state "%s"' % data)
+    except Exception as e:
+        Print('GetState %s' % e)
+    return STATE_NORMAL
+
+def SetState(state):
+    if state != GetState():
+        try:
+            if state == STATE_STANDBY:
+                data = b'standby'
+            elif state == STATE_NORMAL:
+                data = b'normal'
+            else:
+                Print('SetState: unknown state "%d"' % state)
+                data = b'normal'
+
+            # If os.O_FSYNC set, each write call will make sure the data
+            # is reliably stored on disk before returning.
+            O_FSYNC = 0
+            try:
+                O_FSYNC = os.O_FSYNC
+            except Exception:
+                try:
+                    O_FSYNC = os.O_SYNC
+                except Exception as e:
+                    Print('O_FSYNC %s' % e)
+                    O_FSYNC = 0
+            fd = os.open(STATE_FILE, os.O_WRONLY | os.O_TRUNC | O_FSYNC | os.O_CREAT)
+            os.write(fd, data)
+            #if O_FSYNC == 0:
+            try:
+                os.fdatasync(fd)
+            except Exception:
+                try:
+                    os.fsync(fd)
+                except Exception as e:
+                    Print('os.fsync %s' % e)
+            os.close(fd)
+
+        except Exception as e:
+            Print('SetState %s' % e)
+
+def LeaveStandby():
+    Print('LeaveStandby called')
+    SetState(STATE_NORMAL)
+
+def StandbyCountChanged(configElement=None):
+    Print('StandbyCountChanged called')
+    try:
+        SetState(STATE_STANDBY)
+        from Screens.Standby import inStandby
+        if LeaveStandby not in inStandby.onClose:
+            inStandby.onClose.append(LeaveStandby)
+    except Exception as e:
+        Print('StandbyCountChanged: %s' % e)
+
+def DeepStandbyChanged(configElement=None):
+    Print('DeepStandbyChanged called')
+    try:
+        if configElement.value:
+            SetState(STATE_STANDBY)
+    except Exception as e:
+        Print('DeepStandbyChanged: %s' % e)
 
 class eConnectCallbackObj:
     def __init__(self, obj=None, connectHandler=None):
@@ -106,7 +187,7 @@ class PowerOutageHandlerSetup(Screen, ConfigListScreen):
     def BuildList(self):
         self.list = []
 
-        self.list.append(getConfigListEntry(_("Auto Standby after Power Outage"), config.plugins.PowerOutageHandler.Enable))
+        self.list.append(getConfigListEntry(_("Mode"), config.plugins.PowerOutageHandler.Mode))
         self.list.append(getConfigListEntry(_("Delay in seconds"), config.plugins.PowerOutageHandler.Delay))
 
         self["config"].list = self.list
@@ -122,20 +203,18 @@ class PowerOutageHandlerSetup(Screen, ConfigListScreen):
             x[1].save()
 
 class PowerOutageHandlerControl:
-
+    POH_WAKEUP_REASON_PATH = "/tmp/poh_wakeup_reason"
     def __init__(self, m_session):
         self.m_session = m_session
-        self.m_enabled = config.plugins.PowerOutageHandler.Enable.getValue()
+        self.m_enabled = True
         self.m_dialog = None
         self.m_autoTimer = None
         self.m_blinkCnt = 0
+        self.m_actionBind = False
+        try: self.m_fristStart = not os.path.isfile(self.POH_WAKEUP_REASON_PATH)
+        except Exception: self.m_fristStart = True
 
-        self.m_stdoutData = b""
-        self.m_stderrData = b""
-        self.m_console = eConsoleAppContainer()
-        self.m_console_stdoutAvail_conn = eConnectCallback(self.m_console.stdoutAvail, self.dataAvail)
-        self.m_console_stderrAvail_conn = eConnectCallback(self.m_console.stderrAvail, self.stderrAvail)
-        self.m_console_appClosed_conn = eConnectCallback(self.m_console.appClosed, self.cmdFinished)
+        self.m_console = None
 
         pluginPath = os.path.dirname(os.path.abspath(os.path.join(__file__)))
         self.m_binary = os.path.join(pluginPath, 'WakeupReason')
@@ -144,10 +223,32 @@ class PowerOutageHandlerControl:
                 os.chmod(self.m_binary, stat.S_IXUSR|stat.S_IXGRP)
         except Exception as e:
             Print(e)
-        self.m_console.execute(self.m_binary)
+
+        # last state was normal
+        if STATE_NORMAL == GetState():
+            self.disable()
 
         if self.isEnabled():
             eActionMap.getInstance().bindAction('', -0x7FFFFFFF, self.keyPressed)
+            self.m_actionBind = True
+
+        if self.m_fristStart:
+            # we need to call this after each coldboot, to clear wakeup reason after read 
+            # otherwise it will be preserved in case of software reboot on HiSilicon devices
+            self.m_console = eConsoleAppContainer()
+            self.m_console_stdoutAvail_conn = eConnectCallback(self.m_console.stdoutAvail, self.dataAvail)
+            self.m_console_stderrAvail_conn = eConnectCallback(self.m_console.stderrAvail, self.stderrAvail)
+            self.m_console_appClosed_conn = eConnectCallback(self.m_console.appClosed, self.cmdFinished)
+            self.m_stdoutData = b""
+            self.m_stderrData = b""
+            self.m_console.execute(self.m_binary)
+        elif STATE_STANDBY == GetState():
+            # user restart GUI? -> restore last state
+            self.startTimer()
+
+        # we will monitor and save state to restore it after power failure
+        config.misc.standbyCounter.addNotifier(StandbyCountChanged, initial_call=False)
+        config.misc.DeepStandby.addNotifier(DeepStandbyChanged, initial_call=False)
 
     def dataAvail(self, data):
         if data:
@@ -162,6 +263,12 @@ class PowerOutageHandlerControl:
         self.m_console_stdoutAvail_conn = None
         self.m_console = None
 
+        try:
+            with open(self.POH_WAKEUP_REASON_PATH, "wb") as f:
+                f.write(self.m_stdoutData)
+        except Exception as e:
+            Print(e)
+
         if b'(master power)' in (self.m_stdoutData + self.m_stderrData):
             self.m_console = eConsoleAppContainer()
             self.m_console_appClosed_conn = eConnectCallback(self.m_console.appClosed, self.startTimer)
@@ -169,7 +276,7 @@ class PowerOutageHandlerControl:
         else:
             self.disable()
 
-    def startTimer(self, code):
+    def startTimer(self, code=0):
         self.m_console_appClosed_conn = None
         self.m_console_stdoutAvail_conn = None
         self.m_console = None
@@ -181,7 +288,11 @@ class PowerOutageHandlerControl:
             self.m_autoTimer_conn = eConnectCallback(self.m_autoTimer.timeout, self.blink)
             self.m_autoTimer.start(1000)
 
-    def disable(self):
+    def disable(self, goingToStandby=None):
+        state = STATE_STANDBY if IsInStandby() else STATE_NORMAL
+        if not goingToStandby:
+            SetState(state)
+
         if self.m_enabled:
             Print('Disabled')
             self.m_enabled = False
@@ -190,7 +301,9 @@ class PowerOutageHandlerControl:
                     self.m_autoTimer.stop()
                 self.m_autoTimer_conn = None
                 self.m_autoTimer = None
-                eActionMap.getInstance().unbindAction('', self.keyPressed)
+                if self.m_actionBind:
+                    eActionMap.getInstance().unbindAction('', self.keyPressed)
+                    self.m_actionBind = False
             except Exception as e:
                 Print(e)
         try:
@@ -202,7 +315,7 @@ class PowerOutageHandlerControl:
             Print(e)
 
     def isEnabled(self):
-        if inStandby:
+        if IsInStandby():
             self.disable()
         return self.m_enabled
 
@@ -220,8 +333,22 @@ class PowerOutageHandlerControl:
 
             Print('Go to standby!')
 
-            Notifications.AddNotification(Standby)
-            self.disable()
+            goingToStandby = True
+            mode = config.plugins.PowerOutageHandler.Mode.value
+            if mode == 'standby':
+                from Screens.Standby import Standby
+                self.m_session.open(Standby)
+            elif mode == 'standby_notify':
+                from Screens.Standby import Standby
+                from Tools import Notifications
+                Notifications.AddNotification(Standby)
+            elif mode == 'deepstandby':
+                from Screens.Standby import TryQuitMainloop, QUIT_SHUTDOWN
+                self.m_session.open(TryQuitMainloop, QUIT_SHUTDOWN)
+            else:
+                Print('Wrong mode value "%s"' % mode)
+                goingToStandby = False
+            self.disable(goingToStandby)
 
     def keyPressed(self, key, flag):
         Print('keyPressed')
@@ -246,4 +373,4 @@ def Plugins(path, **kwargs):
         Print(e)
 
     return [PluginDescriptor(name="PowerOutageHandler", description = "PowerOutageHandler setup", where = PluginDescriptor.WHERE_PLUGINMENU, fnc = main, needsRestart = False, icon = logo),
-            PluginDescriptor(name="PowerOutageHandler", description = "PowerOutageHandler", where = PluginDescriptor.WHERE_SESSIONSTART, fnc = autostart, needsRestart = False, weight = -1)]
+            PluginDescriptor(name="PowerOutageHandler", description = "PowerOutageHandler v0.2", where = PluginDescriptor.WHERE_SESSIONSTART, fnc = autostart, needsRestart = False, weight = -1)]
